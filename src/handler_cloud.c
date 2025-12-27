@@ -607,10 +607,13 @@ error_t handleCloudContent(HttpConnection *connection, const char_t *uri, const 
 
         stream_ctx_t *stream_ctx = &client_ctx->state->box.stream_ctx;
         stream_ctx->active = false;
+        stream_ctx->sweep = false;
         stream_ctx->quit = false;
         stream_ctx->error = NO_ERROR;
         stream_ctx->stop_on_playback_stop = true;
         stream_ctx->ctx = &ffmpeg_ctx;
+        stream_ctx->queue = NULL;
+        stream_ctx->decoder = NULL;
         stream_ctx->taskParams.priority = 0;
         stream_ctx->taskParams.stackSize = 10 * 1024;
         stream_ctx->taskId = osCreateTask(streamFileRel, &ffmpeg_stream_task, stream_ctx, &stream_ctx->taskParams);

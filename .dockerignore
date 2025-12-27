@@ -1,0 +1,17 @@
+# Build artifacts
+bin/
+obj/
+install/
+
+# IDE and tool directories
+.beads/
+.claude/
+.vscode/
+.idea/
+
+# Git
+.git/
+
+# Temporary files
+*.tmp
+*.log

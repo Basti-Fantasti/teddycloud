@@ -9,6 +9,8 @@
 
 #include "toniefile.h"
 #include "toniefile_queue.h"
+#include "toniefile_encoder.h"
+#include "opus_pool.h"
 #include "handler.h"
 #include "hash/sha1.h"
 #include "error.h"
@@ -537,6 +539,313 @@ error_t toniefile_encode(toniefile_t *ctx, int16_t *sample_buffer, size_t sample
     return NO_ERROR;
 }
 
+/**
+ * @brief Write OGG pages to file, update SHA1 and block tracking
+ *
+ * Helper function to flush OGG pages and maintain state consistency.
+ */
+static error_t toniefile_write_ogg_pages(toniefile_t *ctx)
+{
+    ogg_page og;
+
+    while (ogg_stream_flush(&ctx->os, &og))
+    {
+        if (fsWriteFile(ctx->file, og.header, og.header_len) != NO_ERROR)
+        {
+            return ERROR_FAILURE;
+        }
+        if (fsWriteFile(ctx->file, og.body, og.body_len) != NO_ERROR)
+        {
+            return ERROR_FAILURE;
+        }
+        size_t prev = ctx->file_pos;
+        ctx->file_pos += og.header_len + og.body_len;
+        ctx->audio_length += og.header_len + og.body_len;
+
+        sha1Update(&ctx->sha1, og.header, og.header_len);
+        sha1Update(&ctx->sha1, og.body, og.body_len);
+
+        if ((prev / TONIEFILE_FRAME_SIZE) != (ctx->file_pos / TONIEFILE_FRAME_SIZE))
+        {
+            ctx->taf_block_num++;
+            if (ctx->file_pos % TONIEFILE_FRAME_SIZE)
+            {
+                TRACE_ERROR("Block alignment mismatch 0x%08" PRIX32 "\r\n", (uint32_t)ctx->file_pos)
+                return ERROR_FAILURE;
+            }
+        }
+    }
+    return NO_ERROR;
+}
+
+/**
+ * @brief Calculate max payload size for current file position
+ */
+static int toniefile_calc_max_payload(toniefile_t *ctx, bool *needs_minify)
+{
+    int page_used = (ctx->file_pos % TONIEFILE_FRAME_SIZE) + OGG_HEADER_LENGTH +
+                    ctx->os.lacing_fill - ctx->os.lacing_returned +
+                    ctx->os.body_fill - ctx->os.body_returned;
+    int page_remain = TONIEFILE_FRAME_SIZE - page_used;
+
+    int frame_payload = (page_remain / 256) * 255 + (page_remain % 256) - 1;
+    int reconstructed = (frame_payload / 255) + 1 + frame_payload;
+
+    *needs_minify = false;
+    if (page_remain != reconstructed && frame_payload > OPUS_PACKET_MINSIZE)
+    {
+        frame_payload -= OPUS_PACKET_MINSIZE;
+        *needs_minify = true;
+    }
+
+    return frame_payload;
+}
+
+/**
+ * @brief Process an encoded frame: pad and add to OGG stream
+ */
+static error_t toniefile_process_encoded_frame(toniefile_t *ctx, encoded_frame_t *frame)
+{
+    uint8_t output_frame[TONIEFILE_FRAME_SIZE];
+    bool needs_minify;
+    int frame_payload = toniefile_calc_max_payload(ctx, &needs_minify);
+
+    if (frame_payload < OPUS_PACKET_MINSIZE - 1)
+    {
+        TRACE_ERROR("Not enough space in block for frame, frame_payload=%d\r\n", frame_payload);
+        return ERROR_FAILURE;
+    }
+
+    /* Copy encoded data */
+    int frame_len = (int)frame->length;
+    if (frame_len > (int)sizeof(output_frame))
+    {
+        TRACE_ERROR("Encoded frame too large: %d\r\n", frame_len);
+        return ERROR_FAILURE;
+    }
+    osMemcpy(output_frame, frame->data, frame_len);
+
+    /* Pad if close to target size */
+    if (frame_payload - frame_len < OPUS_PACKET_PAD)
+    {
+        int target_length = frame_payload;
+        int ret = opus_packet_pad(output_frame, frame_len, target_length);
+        if (ret < 0)
+        {
+            TRACE_ERROR("Cannot pad: %s\r\n", opus_strerror(ret));
+            return ERROR_FAILURE;
+        }
+        frame_len = target_length;
+    }
+
+    /* Verify sample count */
+    int frames = opus_packet_get_samples_per_frame(output_frame, OPUS_SAMPLING_RATE) *
+                 opus_packet_get_nb_frames(output_frame, frame_len);
+    if (frames != OPUS_FRAME_SIZE)
+    {
+        TRACE_ERROR("Frame count unexpected: %d instead of %d\r\n", frames, OPUS_FRAME_SIZE);
+    }
+    ctx->ogg_granule_position += frames;
+
+    /* Create OGG packet */
+    ogg_packet op;
+    op.packet = output_frame;
+    op.bytes = frame_len;
+    op.b_o_s = 0;
+    op.e_o_s = 0;
+    op.granulepos = ctx->ogg_granule_position;
+    op.packetno = ctx->ogg_packet_count++;
+
+    ogg_stream_packetin(&ctx->os, &op);
+
+    /* Check if we need to flush */
+    int page_used = (ctx->file_pos % TONIEFILE_FRAME_SIZE) + OGG_HEADER_LENGTH +
+                    ctx->os.lacing_fill + ctx->os.body_fill;
+    int page_remain = TONIEFILE_FRAME_SIZE - page_used;
+
+    if (page_remain < TONIEFILE_PAD_END)
+    {
+        if (page_remain)
+        {
+            TRACE_INFO("Unexpected small padding at %" PRIu64 " (%" PRIu64 " s)\r\n",
+                       ctx->ogg_granule_position, ctx->ogg_granule_position / OPUS_FRAME_SIZE * 60 / 1000);
+            return ERROR_FAILURE;
+        }
+
+        return toniefile_write_ogg_pages(ctx);
+    }
+
+    return NO_ERROR;
+}
+
+error_t toniefile_encode_parallel(toniefile_t *ctx, audio_frame_queue_t *queue,
+                                  opus_encoder_pool_t *pool, size_t num_workers)
+{
+    if (ctx == NULL || queue == NULL || pool == NULL)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    if (num_workers == 0 || num_workers > PARALLEL_ENCODER_WORKERS)
+    {
+        num_workers = PARALLEL_ENCODER_WORKERS;
+    }
+
+    /* Create parallel encoder */
+    parallel_encoder_t *parallel_enc = parallel_encoder_create(pool, num_workers);
+    if (parallel_enc == NULL)
+    {
+        TRACE_ERROR("Failed to create parallel encoder\r\n");
+        return ERROR_FAILURE;
+    }
+
+    error_t result = NO_ERROR;
+    audio_frame_t audio_frame;
+    encoded_frame_t encoded;
+    uint64_t frames_submitted = 0;
+    uint64_t frames_written = 0;
+    bool input_done = false;
+
+    /* Use generous max_payload for encoding - we'll pad appropriately when writing */
+    const int encode_max_payload = TONIEFILE_FRAME_SIZE - OGG_HEADER_LENGTH;
+
+    TRACE_INFO("Starting parallel encoding with %zu workers\r\n", num_workers);
+
+    while (result == NO_ERROR)
+    {
+        /* Submit phase: push audio frames to encoder while there's room */
+        while (!input_done && (frames_submitted - frames_written) < ENCODER_WORK_QUEUE_SIZE)
+        {
+            error_t pop_error = audio_frame_queue_pop(queue, &audio_frame);
+
+            if (pop_error == ERROR_END_OF_STREAM)
+            {
+                input_done = true;
+                break;
+            }
+
+            if (pop_error != NO_ERROR)
+            {
+                TRACE_ERROR("toniefile_encode_parallel: queue pop error=%s\r\n", error2text(pop_error));
+                result = pop_error;
+                break;
+            }
+
+            /* Check for abort signal */
+            if (audio_frame.flags & AUDIO_FRAME_FLAG_ABORT)
+            {
+                TRACE_INFO("toniefile_encode_parallel: abort signaled\r\n");
+                result = ERROR_ABORTED;
+                break;
+            }
+
+            /* Handle new chapter marker */
+            if (audio_frame.flags & AUDIO_FRAME_FLAG_NEW_CHAPTER)
+            {
+                result = toniefile_new_chapter(ctx);
+                if (result != NO_ERROR)
+                {
+                    TRACE_ERROR("toniefile_encode_parallel: new chapter error=%s\r\n", error2text(result));
+                    break;
+                }
+            }
+
+            /* Accumulate samples into full frames */
+            int samples_processed = 0;
+            while (samples_processed < (int)audio_frame.sample_count && result == NO_ERROR)
+            {
+                int samples = OPUS_FRAME_SIZE - ctx->audio_frame_used;
+                int samples_remaining = audio_frame.sample_count - samples_processed;
+                if (samples > samples_remaining)
+                {
+                    samples = samples_remaining;
+                }
+
+                toniefile_samples_copy(ctx->audio_frame, &ctx->audio_frame_used,
+                                       audio_frame.samples, &samples_processed, samples);
+
+                /* Buffer full - submit for encoding */
+                if (ctx->audio_frame_used >= OPUS_FRAME_SIZE)
+                {
+                    error_t submit_error = parallel_encoder_submit(parallel_enc,
+                                                                   ctx->audio_frame,
+                                                                   OPUS_FRAME_SIZE,
+                                                                   encode_max_payload);
+                    if (submit_error != NO_ERROR)
+                    {
+                        TRACE_ERROR("toniefile_encode_parallel: submit error=%s\r\n", error2text(submit_error));
+                        result = submit_error;
+                        break;
+                    }
+                    frames_submitted++;
+                    ctx->audio_frame_used = 0;
+                }
+            }
+
+            /* Check for end of stream marker */
+            if (audio_frame.flags & AUDIO_FRAME_FLAG_END_OF_STREAM)
+            {
+                TRACE_DEBUG("toniefile_encode_parallel: EOS flag received\r\n");
+                input_done = true;
+                break;
+            }
+        }
+
+        /* Signal encoder that no more input is coming */
+        if (input_done && frames_submitted > frames_written)
+        {
+            parallel_encoder_finish(parallel_enc);
+        }
+
+        /* Collect phase: pop encoded frames and write to file */
+        while (frames_written < frames_submitted && result == NO_ERROR)
+        {
+            error_t pop_error = parallel_encoder_pop(parallel_enc, &encoded);
+
+            if (pop_error == ERROR_END_OF_STREAM)
+            {
+                break;
+            }
+
+            if (pop_error != NO_ERROR)
+            {
+                TRACE_ERROR("toniefile_encode_parallel: encoder pop error=%s\r\n", error2text(pop_error));
+                result = pop_error;
+                break;
+            }
+
+            /* Process the encoded frame (pad, OGG packetize, write) */
+            result = toniefile_process_encoded_frame(ctx, &encoded);
+            if (result != NO_ERROR)
+            {
+                TRACE_ERROR("toniefile_encode_parallel: process frame error=%s\r\n", error2text(result));
+                break;
+            }
+
+            frames_written++;
+
+            /* Limit how many we write at once to allow more submits (pipelining) */
+            if (!input_done && frames_submitted - frames_written < ENCODER_WORK_QUEUE_SIZE / 2)
+            {
+                break; /* Go back to submit phase */
+            }
+        }
+
+        /* Check if we're done */
+        if (input_done && frames_written >= frames_submitted)
+        {
+            break;
+        }
+    }
+
+    /* Cleanup */
+    parallel_encoder_destroy(parallel_enc);
+
+    TRACE_INFO("Parallel encoding complete: %" PRIu64 " frames encoded\r\n", frames_written);
+
+    return result;
+}
+
 error_t toniefile_encode_from_queue(toniefile_t *ctx, audio_frame_queue_t *queue)
 {
     audio_frame_t frame;
@@ -892,14 +1201,153 @@ error_t ffmpeg_stream(char source[99][PATH_LEN], size_t source_len, size_t *curr
     return error;
 }
 
+error_t ffmpeg_stream_threaded(stream_ctx_t *stream_ctx, const char *target_taf, bool_t append, bool_t isStream)
+{
+    if (stream_ctx == NULL)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    ffmpeg_stream_ctx_t *ffmpeg_ctx = (ffmpeg_stream_ctx_t *)stream_ctx->ctx;
+    if (ffmpeg_ctx == NULL)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    TRACE_INFO("Threaded encode source: %s\r\n", ffmpeg_ctx->source);
+    TRACE_INFO("as TAF to %s\r\n", target_taf);
+
+    error_t error = NO_ERROR;
+    audio_frame_queue_t *queue = NULL;
+    decoder_ctx_t *decoder = NULL;
+    toniefile_t *taf = NULL;
+
+    /* Create the audio frame queue */
+    queue = audio_frame_queue_create();
+    if (queue == NULL)
+    {
+        TRACE_ERROR("Failed to create audio frame queue\r\n");
+        return ERROR_OUT_OF_MEMORY;
+    }
+    stream_ctx->queue = queue;
+
+    /* Create decoder context linked to stream_ctx flags
+     * Note: sweep is on ffmpeg_ctx because handler_cloud.c modifies it
+     * after the task starts to control the startup buffer sweep */
+    decoder = decoder_ctx_create(queue, &stream_ctx->active, &ffmpeg_ctx->sweep);
+    if (decoder == NULL)
+    {
+        TRACE_ERROR("Failed to create decoder context\r\n");
+        audio_frame_queue_destroy(queue);
+        stream_ctx->queue = NULL;
+        return ERROR_OUT_OF_MEMORY;
+    }
+    stream_ctx->decoder = decoder;
+
+    /* Add source to decoder */
+    error = decoder_add_source(decoder, ffmpeg_ctx->source);
+    if (error != NO_ERROR)
+    {
+        TRACE_ERROR("Failed to add source to decoder: %s\r\n", error2text(error));
+        goto cleanup;
+    }
+
+    /* Set skip seconds */
+    decoder_set_skip_seconds(decoder, ffmpeg_ctx->skip_seconds);
+
+    /* Create output TAF file */
+    int32_t size = 0;
+    if (isStream)
+    {
+        size = get_settings()->encode.stream_max_size - TONIE_HEADER_LENGTH;
+    }
+    taf = toniefile_create(target_taf, time(NULL) - TEDDY_BENCH_AUDIO_ID_DEDUCT, append, size);
+    if (taf == NULL)
+    {
+        TRACE_ERROR("toniefile_create() failed\r\n");
+        error = ERROR_FAILURE;
+        goto cleanup;
+    }
+
+    /* Start decoder thread */
+    error = decoder_start(decoder);
+    if (error != NO_ERROR)
+    {
+        TRACE_ERROR("Failed to start decoder: %s\r\n", error2text(error));
+        goto cleanup;
+    }
+
+    /* Signal that we're active (decoder_start sets this, but ensure it's set) */
+    stream_ctx->active = TRUE;
+
+    TRACE_INFO("Threaded pipeline started, encoding from queue...\r\n");
+
+    /* Encode from queue (blocking until complete or error) */
+    error = toniefile_encode_from_queue(taf, queue);
+
+    /* Check for decoder error if encode didn't report one */
+    if (error == NO_ERROR)
+    {
+        error = decoder_get_error(decoder);
+    }
+
+    /* Update current source from decoder */
+    stream_ctx->current_source = decoder_get_current_source(decoder);
+
+cleanup:
+    /* Stop decoder if still running */
+    if (decoder != NULL)
+    {
+        if (decoder_is_running(decoder))
+        {
+            stream_ctx->active = FALSE;
+            decoder_stop(decoder);
+        }
+        decoder_ctx_destroy(decoder);
+        stream_ctx->decoder = NULL;
+    }
+
+    /* Close TAF file */
+    if (taf != NULL)
+    {
+        toniefile_close(taf);
+    }
+
+    /* Destroy queue */
+    if (queue != NULL)
+    {
+        audio_frame_queue_destroy(queue);
+        stream_ctx->queue = NULL;
+    }
+
+    /* Set active to false to signal completion */
+    stream_ctx->active = FALSE;
+
+    if (error == NO_ERROR)
+    {
+        TRACE_INFO("Threaded TAF encoding successful\r\n");
+    }
+    else if (isStream)
+    {
+        TRACE_INFO("Threaded TAF encoding stopped (streaming)\r\n");
+    }
+    else
+    {
+        TRACE_ERROR("Threaded TAF encoding failed: %s\r\n", error2text(error));
+        fsDeleteFile(target_taf);
+    }
+
+    return error;
+}
+
 void ffmpeg_stream_task(void *param)
 {
     stream_ctx_t *stream_ctx = (stream_ctx_t *)param;
     ffmpeg_stream_ctx_t *ffmpeg_ctx = (ffmpeg_stream_ctx_t *)stream_ctx->ctx;
 
-    char source[99][PATH_LEN]; // waste memory, but warning otherwise
-    strncpy(source[0], ffmpeg_ctx->source, PATH_LEN - 1);
-    stream_ctx->error = ffmpeg_stream(source, 1, &stream_ctx->current_source, ffmpeg_ctx->targetFile, ffmpeg_ctx->skip_seconds, &stream_ctx->active, &ffmpeg_ctx->sweep, ffmpeg_ctx->append, true);
+    /* Use threaded pipeline for streaming */
+    stream_ctx->error = ffmpeg_stream_threaded(stream_ctx, ffmpeg_ctx->targetFile, ffmpeg_ctx->append, true);
+
     stream_ctx->quit = true;
-    osDeleteTask((OsTaskId) OS_SELF_TASK_ID);
+    osDeleteTask((OsTaskId)OS_SELF_TASK_ID);
 }

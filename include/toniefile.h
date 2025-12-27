@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include "fs_ext.h"
 #include "toniefile_queue.h"
+#include "toniefile_decoder.h"
+#include "opus_pool.h"
 
 #define OPUS_FRAME_SIZE_MS OPUS_FRAMESIZE_60_MS
 #define OPUS_SAMPLING_RATE 48000
@@ -36,6 +38,7 @@ typedef struct toniefile_s toniefile_t;
 typedef struct
 {
     bool_t active;
+    bool_t sweep;
     size_t current_source;
     error_t error;
     OsTaskId taskId;
@@ -43,6 +46,9 @@ typedef struct
     bool_t stop_on_playback_stop;
     OsTaskParameters taskParams;
     void *ctx;
+    /* Threaded pipeline components (optional) */
+    audio_frame_queue_t *queue;
+    decoder_ctx_t *decoder;
 } stream_ctx_t;
 
 typedef struct
@@ -58,6 +64,8 @@ toniefile_t *toniefile_create(const char *fullPath, uint32_t audio_id, bool appe
 error_t toniefile_close(toniefile_t *ctx);
 error_t toniefile_encode(toniefile_t *ctx, int16_t *sample_buffer, size_t samples_available);
 error_t toniefile_encode_from_queue(toniefile_t *ctx, audio_frame_queue_t *queue);
+error_t toniefile_encode_parallel(toniefile_t *ctx, audio_frame_queue_t *queue,
+                                  opus_encoder_pool_t *pool, size_t num_workers);
 error_t toniefile_write_header(toniefile_t *ctx);
 error_t toniefile_new_chapter(toniefile_t *ctx);
 
@@ -68,5 +76,6 @@ FILE *ffmpeg_decode_audio_start_skip(const char *input_source, size_t skip_secon
 error_t ffmpeg_decode_audio_end(FILE *ffmpeg_pipe, error_t error);
 error_t ffmpeg_decode_audio(FILE *ffmpeg_pipe, int16_t *buffer, size_t size, size_t *blocks_read);
 error_t ffmpeg_stream(char source[99][PATH_LEN], size_t source_len, size_t *current_source, const char *target_taf, size_t skip_seconds, bool_t *active, bool_t *sweep, bool_t append, bool_t isStream);
+error_t ffmpeg_stream_threaded(stream_ctx_t *stream_ctx, const char *target_taf, bool_t append, bool_t isStream);
 error_t ffmpeg_convert(char source[99][PATH_LEN], size_t source_len, size_t *current_source, const char *target_taf, size_t skip_seconds);
 void ffmpeg_stream_task(void *param);
