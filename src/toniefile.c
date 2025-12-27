@@ -8,6 +8,7 @@
 #include <stdio.h>
 
 #include "toniefile.h"
+#include "toniefile_queue.h"
 #include "handler.h"
 #include "hash/sha1.h"
 #include "error.h"
@@ -530,6 +531,74 @@ error_t toniefile_encode(toniefile_t *ctx, int16_t *sample_buffer, size_t sample
             }
             /* fill again */
             ctx->audio_frame_used = 0;
+        }
+    }
+
+    return NO_ERROR;
+}
+
+error_t toniefile_encode_from_queue(toniefile_t *ctx, audio_frame_queue_t *queue)
+{
+    audio_frame_t frame;
+    error_t error;
+
+    if (ctx == NULL || queue == NULL)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    /* Main encoding loop - pop frames from queue and encode */
+    while (TRUE)
+    {
+        error = audio_frame_queue_pop(queue, &frame);
+
+        if (error == ERROR_END_OF_STREAM)
+        {
+            /* Queue closed and drained - normal completion */
+            TRACE_DEBUG("toniefile_encode_from_queue: end of stream\r\n");
+            break;
+        }
+
+        if (error != NO_ERROR)
+        {
+            TRACE_ERROR("toniefile_encode_from_queue: pop error=%s\r\n", error2text(error));
+            return error;
+        }
+
+        /* Check for abort signal */
+        if (frame.flags & AUDIO_FRAME_FLAG_ABORT)
+        {
+            TRACE_INFO("toniefile_encode_from_queue: abort signaled\r\n");
+            return ERROR_ABORTED;
+        }
+
+        /* Handle new chapter marker */
+        if (frame.flags & AUDIO_FRAME_FLAG_NEW_CHAPTER)
+        {
+            error = toniefile_new_chapter(ctx);
+            if (error != NO_ERROR)
+            {
+                TRACE_ERROR("toniefile_encode_from_queue: new chapter error=%s\r\n", error2text(error));
+                return error;
+            }
+        }
+
+        /* Encode the samples using existing function */
+        if (frame.sample_count > 0)
+        {
+            error = toniefile_encode(ctx, frame.samples, frame.sample_count);
+            if (error != NO_ERROR)
+            {
+                TRACE_ERROR("toniefile_encode_from_queue: encode error=%s\r\n", error2text(error));
+                return error;
+            }
+        }
+
+        /* Check for end of stream marker (graceful completion from producer) */
+        if (frame.flags & AUDIO_FRAME_FLAG_END_OF_STREAM)
+        {
+            TRACE_DEBUG("toniefile_encode_from_queue: EOS flag received\r\n");
+            break;
         }
     }
 

@@ -2,6 +2,7 @@
 #pragma once
 #include <stdint.h>
 #include "fs_ext.h"
+#include "toniefile_queue.h"
 
 #define OPUS_FRAME_SIZE_MS OPUS_FRAMESIZE_60_MS
 #define OPUS_SAMPLING_RATE 48000
@@ -56,6 +57,7 @@ typedef struct
 toniefile_t *toniefile_create(const char *fullPath, uint32_t audio_id, bool append, int32_t size);
 error_t toniefile_close(toniefile_t *ctx);
 error_t toniefile_encode(toniefile_t *ctx, int16_t *sample_buffer, size_t samples_available);
+error_t toniefile_encode_from_queue(toniefile_t *ctx, audio_frame_queue_t *queue);
 error_t toniefile_write_header(toniefile_t *ctx);
 error_t toniefile_new_chapter(toniefile_t *ctx);
 
